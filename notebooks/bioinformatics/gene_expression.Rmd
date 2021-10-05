@@ -1,0 +1,362 @@
+---
+title: "hw10"
+author: "Adriana Bukała"
+date: "5/18/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+```{r, message=F}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+```
+
+### Data preprocessing
+Load **raw** gene/cell matrix data.
+```{r}
+pbmc.data <- Read10X(data.dir = "data/matrices_mex/hg19/")
+```
+
+Initialize the Seurat object with the raw (non-normalized data).
+```{r}
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+pbmc
+```
+
+Let's examine a few genes in the first thirty cells
+```{r}
+pbmc.data[c("CD3D", "TCL1A", "MS4A1"), 1:30]
+```
+
+```{r}
+max(pbmc.data)
+dim(pbmc.data)
+```
+
+The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+```{r}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+```
+
+Show QC metrics for the first 5 cells
+```{r}
+head(pbmc@meta.data, 5)
+```
+
+Visualize QC metrics as a violin plot.
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+
+It's really hard to see anything, right?
+```{r}
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+```
+
+FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+```{r}
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+```
+
+```{r}
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+
+Our data is a bit messy, so we need to filter and normalize it.
+```{r}
+pbmc <- subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+```{r}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+```{r}
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+```
+
+Identify the 10 most highly variable genes.
+```{r}
+top10 <- head(VariableFeatures(pbmc), 10)
+top10
+```
+
+Plot variable features with and without labels.
+```{r}
+plot1 <- VariableFeaturePlot(pbmc)
+plot1
+```
+
+```{r}
+LabelPoints(plot = plot1, points = top10, repel = F)
+```
+
+Scale the data.
+```{r}
+pbmc <- ScaleData(pbmc)
+```
+
+Do PCA.
+```{r}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+```
+
+Examine and visualize PCA results a few different ways
+```{r}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+```
+
+```{r}
+DimPlot(pbmc, reduction = "pca")
+```
+
+```{r}
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+
+We can see two elbow points - around 8. and 9. PC, and around 12. and 13.
+```{r}
+ElbowPlot(pbmc)
+```
+
+Extract first **12** PCs as we chose second elbow point.
+
+### Clustering
+We will use shared nearest neighbors method, because it's easier to use along with other Seurat functionalities than basic k-means one.
+```{r}
+pbmc <- FindNeighbors(pbmc, dims = 1:12)
+```
+
+**NOTE: as we found 14 communities (clusters), we will stick with this number instead of proposed 10 clusters. Additional clusters are probably small, so authors of our reference paper didn't consider them as that important, but we believe that these clusters could consist of important (however rare) features.**
+```{r}
+pbmc <- FindClusters(pbmc, resolution = 0.5)
+```
+
+
+```{r}
+pbmc <- RunTSNE(object = pbmc, reduction = 'pca', dims = 1:12)
+```
+
+### Problem 1
+Reproduced Figure 3b on Zheng et al. 2017.
+Important chosen parameters:
+* **12** PCs (not 10),
+* **14** clusters found by **shared nearest neighbors** method (not 9, and not using k-means),
+* regularization done using **t-SNE**.
+```{r}
+DimPlot(pbmc, reduction = 'tsne')
+```
+
+### Problem 2
+#### 2.1
+Our workflow:
+* subset data according to the cluster from 1st clustering,
+* normalize, find variable features, scale, run PCA, do clustering and t-SNE decomposition - so we repeat our main workflow on the subset of the whole data,
+* as we don't know, how many variables to choose (because some clusters could be much smaller/larger than others), we choose **mvp** method for computing variable features,
+* as making elbow plots in one for loop and choosing number of PCs in another would take a lot of time, we set number of PCs to **8** for each cluster. It's smaller than previously used 12, so it could cooperate with smaller clusters, but, hopefully, large enough to cooperate with bigger ones as well,
+* we decrease **resolution = 0.3**, so we get a smaller number of subclusters, because more clusters != less clear plot with whole data in point 2.2,
+* we compute t-SNE reduction as well with **perplexity = 20**, because default number (30) was too big for smaller clusters.
+
+Finally, we will make two plots for each cluster:
+1. **left** - with t-SNE projection computed on subset data; it should be more informative of our subclusters,
+2. **right** - with fragment of t-SNE projection computed on whole data; it should give us an overall idea, where in the whole dataset is our subset.
+```{r, warning=F, message=F}
+subsets <- vector(mode = "list", length = 14)
+
+for (i in 1:14) {
+  subset <- subset(pbmc, idents = c(i - 1))
+  
+  subset <- NormalizeData(subset, normalization.method = "LogNormalize", scale.factor = 10000)
+  subset <- FindVariableFeatures(subset, selection.method = "mvp")
+  subset <- ScaleData(subset)
+  subset <- RunPCA(subset, features = VariableFeatures(object = subset))
+  
+  subset <- FindNeighbors(subset, dims = 1:8)
+  subset <- FindClusters(subset, resolution = 0.3)
+  
+  subsets[i] <- subset
+  
+  subset_ <- RunTSNE(object = subset, reduction = 'pca', dims = 1:8, perplexity = 20)
+  print(DimPlot(subset_, reduction = 'tsne') + DimPlot(subset, reduction = 'tsne') + plot_annotation(title = i))
+}
+
+```
+
+
+### 2.2
+We need to change cluster ids, so we have no repetitions.
+```{r}
+cluster_ids <- vector(mode = "list", length = 14)
+feature_names <- vector(mode = "list", length = 14)
+
+for (i in 1:14) {
+  if (i == 1) {
+    max_id <- 0
+  } else {
+    max_id <- max(cluster_ids[[i - 1]])
+  }
+  
+  subset_ids <- as.numeric(Idents(subsets[[i]]))
+  feature_names[[i]] <- names(Idents(subsets[[i]]))
+  max_id_ <- max_id + max(subset_ids) + 1
+  cluster_ids[[i]] <- subset_ids + max_id
+  max_id <- max_id_
+}
+```
+
+
+```{r}
+print(unique(cluster_ids[[1]]))
+print(unique(cluster_ids[[2]]))
+print(unique(cluster_ids[[14]]))
+```
+
+We need to extract whole t-SNE data.
+```{r}
+tsne_data <-pbmc@reductions$tsne@cell.embeddings
+head(tsne_data)
+```
+
+
+```{r}
+mylist <- list()
+cluster_ids2 <- unlist(cluster_ids)
+
+for (i in 1:dim(tsne_data)[1]) {
+  mylist[[i]] <- c(tsne_data[i, 'tSNE_1'], tsne_data[i, 'tSNE_2'], cluster_ids2[i])
+}
+df <- do.call("rbind", mylist)
+```
+
+```{r}
+colnames(df) <- c('tsne1', 'tsne2', 'cluster')
+rownames(df) <- unlist(feature_names)
+df <- as.data.frame(df)
+```
+
+
+```{r}
+head(df)
+```
+
+
+```{r}
+df <- df[with(df, order(cluster)), ]
+```
+
+```{r}
+library(RColorBrewer)
+n <- 50
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector <- unique(sample(col_vector, n))
+```
+
+```{r}
+df$color <- apply(df, MARGIN = 1, FUN = function(row) {
+    return (col_vector[as.numeric(row[3])])
+  })
+```
+
+
+```{r}
+library(ggplot2)
+
+plot <- ggplot(df) +
+    geom_point(aes(x = tsne1, y = tsne2, color = color), pch = 16, alpha = 0.6) +
+    scale_colour_manual(name = "cluster",
+                         labels = unique(df$cluster),
+                         values = unique(df$color)) +
+    ggtitle("tSNE representation with subpopulations") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+Well, it's hard to see anything, because we have **43** (sic!) clusters. But we know from the single plots (2.1) that our subclusters looked good.
+```{r}
+plot
+```
+
+We can compare this plot to the first level of clustering.
+```{r}
+DimPlot(pbmc, reduction = 'tsne')
+```
+
+
+### Appendix: failed attempts of using k-means (it's not compatible with Seurat's format)
+```{r, eval = F}
+#library(caret)
+library(cluster)
+pca <- pbmc@reductions$pca@feature.loadings[, 1:12]
+pca[1:5, ]
+```
+
+Find an optimal number of cluster using silhouette score. **Silhouette score** is a metrics grading goodness of the clustering without known ground truth, so when true cluster labels are unknown. It computes a score for each observation (each gene in our case). Score close to 1 means that a gene is well-clustered, score near 0 means that gene is somewhere between two clusters, and a negative score means that a gene should probably belong to another cluster. We will compute score based on **euclidean** distance between computed PCs.
+```{r, eval = F}
+silhouette_score <- function(k){
+  km <- kmeans(pca, centers = k)
+  # compute a silhouette score for each clustering, based on euclidean distance matrix computed on PCs
+  ss <- silhouette(km$cluster, dist(pca))
+  return (c(mean(ss[, 3]), km$cluster))
+}
+```
+
+**Unfortunately, this k-means implementation is not stable - results depend on initialization of first cluster centers. That's why we will set a random seed (to ensure reproducibility), but be aware that you could get another optimal k (number of clusters) with another random seed.**
+```{r, eval = F}
+set.seed(32)
+
+k <- 2:16
+results <- sapply(k, silhouette_score)
+plot(k, type = 'b', results[1, ], xlab = 'Number of clusters', ylab = 'Average Silhouette Scores', frame = FALSE)
+```
+
+With chosen random seed, optimal number of clusters is equal to **13** (it's where we can see a peak in silhouette score). **Because of our chosen metrics, we will use 13 clusters from now on (not 10 like suggested in the homework's description).**
+
+```{r, eval = F}
+# different enumeration
+basic_clusters <- results[2:2001, 13 - 1]
+```
+
+Now we can visualize our data using t-SNE.
+```{r, eval = F}
+pbmc <- RunTSNE(object = pbmc, features = pbmc@reductions$pca@feature.loadings, dims = 1:12)
+```
+
+
+```{r, eval = F}
+DimPlot(pbmc, reduction = 'tsne')
+```
+
+```{r, eval = F}
+library(ggplot2)
+
+tsne_data <- as.data.frame(pbmc@reductions$tsne@cell.embeddings)
+tsne_data
+
+ggplot(tsne_data, aes(reductions$tsne@cell.embeddings[, 1], reductions$tsne@cell.embeddings[, 2]))
+```
+
+Cluster data.
+```{r, eval = F}
+km <- kmeans(pbmc@reductions$pca@cell.embeddings[, 1:12], centers = 13)
+km$cluster
+#ss <- mean(silhouette(km$cluster, dist(pbmc@reductions$pca@cell.embeddings[, 1:12]))[, 3])
+```
+
+```{r, eval = F}
+library(tsne)
+tsne_data <- tsne(pca, initial_dims = 1:12, k = 2)
+```
+
+Look at cluster IDs of the first 5 cells
+```{r, eval = F}
+plot(tsne_data)
+```
